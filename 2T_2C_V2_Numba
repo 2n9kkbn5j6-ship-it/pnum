@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov  6 11:02:35 2025
+
+@author: 33782
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import numba
+
+#%%
+
+N = 100        #Cote de la matrice
+T_boltz = 1
+J_12 = 1
+J_10 = 1
+J_20 = 1
+lbda = 0.5
+V_cible = 2000
+
+
+#%%
+
+@numba.jit
+def initial_state_2_rond(r):
+    M = np.zeros((N, N))
+    centre_x_1, centre_y_1 = int(2*N/3), int(2*N/3)
+    centre_x_2, centre_y_2 = int(N/3), int(N/3)
+
+
+    for i in range(N):
+        for j in range(N):
+            if np.sqrt((i - centre_x_1)**2 + (j - centre_y_1)**2) <= r:
+                M[i,j] = 1
+
+    for i in range(N):
+        for j in range(N):
+            if np.sqrt((i - centre_x_2)**2 + (j - centre_y_2)**2) <= r:
+                M[i,j] = 2
+    return M
+
+
+@numba.jit
+def initial_state_2_carre():
+    '''
+
+    Returns
+    -------
+    Une matrice de 0 de taille N avec un carre de 1 au centre
+    '''
+
+    M = np.zeros((N, N))
+    M[40:60, 40:60] = 1
+    M[50:70, 55:75] = 2
+
+    return M
+
+#plt.imshow(initial_state_2_rond(35))
+
+#%%
+
+@numba.jit
+def J(a,b):
+    if (a,b) in [(0,1),(1,0)]: return J_10
+    if (a,b) in [(0,2),(2,0)]: return J_20
+    if (a,b) in [(1,2),(2,1)]: return J_12
+    return 0
+
+
+
+#%%
+@numba.jit
+def coupling_neighborhood(M, i, j):
+    return np.array([M[(i+1)%N, j], M[(i-1)%N, j], M[i, (j+1)%N], M[i, (j-1)%N]])
+
+@numba.jit
+def target_neighborhood(M, i, j):
+    return np.array([M[(i+1)%N, j], M[(i-1)%N, j], M[i, (j+1)%N], M[i, (j-1)%N],
+                     M[(i+1)%N, (j-1)%N], M[(i-1)%N, (j-1)%N], M[(i+1)%N, (j+1)%N], M[(i-1)%N, (j+1)%N]])
+
+
+#%%
+
+
+@numba.jit
+def increase_temps(M, nb_change, T=T_boltz, J_10=J_10, J_20=J_20, J_12=J_12, lbda=lbda, V_cible=V_cible):
+    '''
+    Parameters
+    ----------
+    M : matrice, de taille NxN
+        La matrice de laquelle on part
+    nb_change : int
+        Le nombre de changements par pas de temps
+
+    Returns
+    -------
+    M : matrice, de taille NxN
+        La MEME matrice, avec modifications eventuellement
+
+    '''
+
+
+    for _ in range(nb_change):
+
+        i, j = np.random.randint(0, N, 2) #l'indice de la matrice à changer
+
+        voisins_target = target_neighborhood(M,i,j) #Pareil pour l'interfaace, je n'ai pas besoi de tout reclculer, mais uste localement
+        voisins_coupling = target_neighborhood(M,i,j)
+
+        val_old = M[i,j]   #Au lieu de faire une copie de toute ma matrice avec np.copy, je fais juste une copie de l'élément intéresant
+        val_new = voisins_target[np.random.randint(8)]
+
+        dE_int = 0
+        for v in voisins_coupling:
+            dE_int += J(val_new, v) - J(val_old, v)
+
+        dV1 = (1 if val_new == 1 else 0) - (1 if val_old == 1 else 0)
+        dV2 = (1 if val_new == 2 else 0) - (1 if val_old == 2 else 0)
+
+        V1 = np.sum(M == 1)
+        V2 = np.sum(M == 2)
+
+
+
+        dE_vol = lbda * ((V1 + dV1 - V_cible)**2 - (V1 - V_cible)**2) + lbda * ((V2 + dV2 - V_cible)**2 - (V2 - V_cible)**2)
+
+        dE = dE_int + dE_vol
+
+        # --- Metropolis ---
+        if dE <= 0 or np.random.rand() < np.exp(-dE / T):
+            M[i,j] = val_new
+
+    return M
+
+#%%
+
+# M = initial_state_2_rond(25)
+M = initial_state_2_carre()
+
+def def_temp(M, nb_pas):
+    M = np.copy(M)
+    # summ = np.zeros(nb_pas)
+    for i in range(nb_pas):
+        increase_temps(M, 10)
+        # summ[i] = np.sum(M)
+        if i % 1000 == 0:
+            plt.imshow(M)
+            plt.title(i)
+            plt.axis('off')
+            plt.show()
+    # plt.plot(np.arange(0,nb_pas, 1), summ)
+    # plt.xlabel('temps')
+    # plt.ylabel('nombre de pixels 1')
+
+def_temp(M, 100000)
+
+
