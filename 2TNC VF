@@ -1,0 +1,303 @@
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov 13 11:03:11 2025
+
+@author: 33782
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import numba
+from skimage.segmentation import find_boundaries
+
+
+#%% Paramètres globaux
+
+N = 100        #Cote de la matrice
+n1 = 20     #nb de cellules de type 1 simulées
+n2 = 10     # nombre de cellules du type 2
+
+
+T_boltz = 10   #Température de boltzmann
+lbda = 1    #Elasticité
+
+#Tensions de surface
+J_11 = 2
+J_10 = 16
+J_12 = 11
+J_20 = 40
+J_22 = 14
+
+
+#Les volumes cibles, on en fait une liste pour pouvoir les changer un par un plus tard
+V_cible_1 = np.zeros(n1) + 150
+V_cible_2 = np.zeros(n2) + 100
+V_cible = np.concatenate((V_cible_1, V_cible_2)) #L'ensemble des volumes cibles
+
+
+#%% Pour l'affichage
+
+def plot_type(M, time=None, cmap='gray'):
+    ''' 
+    M une matrice [N,N,2], pour afficher les cellules de même type dans la même couleur, avec une frontière pour les différencier
+    '''
+    
+    couleur_frontiere = np.max(M[:,:,0]) + 1 #On fait ressortir les frontières entre cellules
+    a = M[:, :, 1]      #La matrice avec les numéros des cellules
+    borders = find_boundaries(a, mode='inner')  #Trouve les frontières
+
+    img = M[:, :, 0].copy()  #Copie, pour ne pas abimer la matrice
+    img[borders] = couleur_frontiere  # surimpression des bordures
+
+    plt.imshow(img, cmap=cmap, interpolation='nearest') #On affiche
+    if time is not None:
+        plt.title(f"t = {time}")
+    plt.axis('off')
+    plt.show()
+
+
+#%% Condition initiale
+
+
+def initial_state_rond(M, n, type_cellule):
+    '''
+    Initialise la matrice M, avec n cellules rondes de rayon rr tirés aléatoirement vers le centre ce la matrice
+    '''
+    
+    Centres = np.random.randint(int(N/5),int(4*N/5),(n,2)) #On tire les centres pour qu'ils ne soient pas près du bord de la matrice
+
+    rr = 4                      #Le rayon des cellules
+    
+    for cell_num in range(n):
+        cell_num = int(cell_num)
+        cx, cy = Centres[cell_num, 0], Centres[cell_num, 1] 
+        
+        for i in range(-rr, rr+1):
+            for j in range(-rr, rr+1):
+                
+                x, y = cx+i, cy+j
+                
+                if (i**2 + j**2) <= rr**2:
+                    M[x,y,0] = type_cellule
+                    M[x,y,1] = cell_num + 1     
+      
+    return M
+
+
+M = np.zeros((N, N, 2), dtype=np.int32)
+
+M = initial_state_rond(M, n1, 1)
+M = initial_state_rond(M, n2, 2)         #Les cellules 2 vont se superposer aux cellules 1, mais ce n'est pas grave
+plot_type(M, time = None, cmap = 'inferno')
+
+
+#%%
+@numba.njit
+def coupling_neighborhood(M, i, j):
+    return np.array([M[(i+1)%N, j], M[(i-1)%N, j], M[i, (j+1)%N], M[i, (j-1)%N]])
+
+@numba.njit
+def target_neighborhood(M, i, j):
+    return np.array([M[(i+1)%N, j], M[(i-1)%N, j], M[i, (j+1)%N], M[i, (j-1)%N], 
+                     M[(i+1)%N, (j-1)%N], M[(i-1)%N, (j-1)%N], M[(i+1)%N, (j+1)%N], M[(i-1)%N, (j+1)%N]])
+
+
+#%% Je sotcke les valeurs du volume pou ne paas avoir à les recalculer à chaque fois
+
+V_c = np.zeros(n1+n2, dtype=np.int32)
+
+for i in range(N):
+    for j in range(N):
+        num = M[i,j,1]
+        if num > 0:
+            idx = num-1 if M[i,j,0] == 1 else n1+num-1
+            V_c[idx] += 1
+
+
+
+#%%Energie de surface
+
+
+J_matrice = np.array([[0, J_10, J_20],
+                      [J_10, J_11, J_12],
+                      [J_20, J_12, J_22]])
+
+@numba.njit
+def J(type_cell, num_cell, type_voisin, num_voisin):
+    '''
+    Renvoie la bonne valeur de J entre deux pixels voisins
+    '''
+    type_cell, type_voisin = int(type_cell), int(type_voisin)
+    
+    if type_cell != type_voisin :
+        return J_matrice[type_cell, type_voisin] 
+    
+    elif num_cell != num_voisin :
+        return J_matrice[type_cell, type_voisin]
+        
+    return 0
+#%%
+
+voisins_numero = np.array([(1,0),(-1,0),(0,1),(0,-1), (1,1), (-1,-1), (1,-1), (-1,1)]) #Les 8 voisins, c'est ce qui marche le mieux 
+
+@numba.njit
+def dE_surf_local(M,i,j, type_old, num_old, type_new, num_new):
+    '''
+    On change l'élément i,j de M, la fonction renvoie l'éergie de surface que ce changement coute
+    '''
+    dE_surf = 0
+    
+    for (dx, dy) in voisins_numero: #Pour chaque voisins
+        xi, xj = (i + dx) % N, (j + dy) % N       #Les indices, avec CLP (condition limite périodique)
+        
+        
+        type_voisin, num_voisin = M[xi, xj, :]
+        
+        
+        E_avant = J(type_old, num_old, type_voisin, num_voisin)
+        E_apres = J(type_new, num_new, type_voisin, num_voisin)
+            
+        dE_surf += (E_apres - E_avant)
+    
+    return dE_surf
+
+
+@numba.njit
+def dE_volume_local(V_c, V_cible, type_old, num_old, type_new, num_new):
+    '''
+    On change l'élément i,j de M, la fonction renvoie l'éergie de volume que ce changement coute
+    '''
+    dE = 0.0
+
+    if num_old > 0:                  # Si on était dans une cellule
+        if type_old == 1:           #Si c'est une cellule 1
+            idx_old = num_old - 1   
+            
+            
+        else:                       #Si c'est une cellule 2
+            idx_old = n1 + num_old - 1   # Inutile, maintenant que toutes les cellules 2 ont le même volume cible...
+            
+        V_before = V_c[idx_old]
+        dE += (V_before - 1 - V_cible[idx_old])**2 - (V_before - V_cible[idx_old])**2
+
+    if num_new > 0:         #Si la nouvelle valeur est dans une cellule
+        
+        if type_new == 1:     #Si on créé un pixel 1
+            
+            idx_new = num_new - 1   
+        else:                #Si on créé un pixel 2
+            
+            
+            idx_new = n1 + num_new - 1
+            
+            
+            
+        V_before = V_c[idx_new]
+        dE += (V_before + 1 - V_cible[idx_new])**2 - (V_before - V_cible[idx_new])**2
+
+    return lbda * dE
+    
+
+
+
+#%%
+
+
+
+
+@numba.njit
+def increase_temps(M, V_c, nb_change, T=T_boltz, V_cible=V_cible):
+    """
+    Effectue `nb_change`  Metropolis sur M et met à jour M et V_c en place et renvoie (M, V_c). 1 MCS
+    """
+
+    for _ in range(nb_change):
+
+        i, j = np.random.randint(0, N, 2) #l'indice de la matrice à changer
+    
+        type_old = int(M[i,j,0])   #Au lieu de faire une copie de toute ma matrice avec np.copy, je fais juste une copie de l'élément intéresant
+        num_old = int(M[i,j,1]) #L'ancien numéro de la matrice
+
+        # choisir un voisin aléatoire parmis les 8 voisins
+        di, dj = voisins_numero[np.random.randint(0,8)]
+        ni, nj = (i + di) % N, (j + dj) % N #Choisir le nouveau voisin, aléatoirement
+        
+
+        type_new = int(M[ni, nj, 0])
+        num_new  = int(M[ni, nj, 1])
+
+        if num_new == num_old:
+            continue        #Par soucis d'optimisation, on ne calcule rien si on ne change rien
+
+        dE_int = dE_surf_local(M, i, j, type_old, num_old, type_new, num_new)                
+        dE_vol = dE_volume_local(V_c, V_cible, type_old, num_old, type_new, num_new)
+        
+        dE = dE_int + dE_vol  #Variation d'énergie
+
+        'Métropolis'
+        if dE <= 0 or np.random.random() < np.exp(-dE / T):
+            # calculer les indices des cellules affectées AVANT de modifier V_c
+            if num_old > 0:
+                idx_old = (num_old - 1) if (type_old == 1) else (n1 + num_old - 1)
+            else:
+                idx_old = -1
+
+            if num_new > 0:
+                idx_new = (num_new - 1) if (type_new == 1) else (n1 + num_new - 1)
+            else:
+                idx_new = -1
+
+            
+            M[i, j, 0] = type_new
+            M[i, j, 1] = num_new   # On applique le changement sur M
+
+            # On met à jour les volumes
+            if idx_old >= 0:
+                V_c[idx_old] -= 1
+            if idx_new >= 0:
+                V_c[idx_new] += 1
+
+    return M, V_c
+
+
+#%% Pour faire défiler le temps
+            
+
+def def_temp(M, nb_pas):
+    '''
+    Une fonction pour faire défiler le temps, fait nb_pas MCS
+    '''
+    M = np.copy(M)
+    for i in range(nb_pas):
+        increase_temps(M, V_c, N**2)
+        if i % 10 == 0:
+            plot_type(M, time = i, cmap = 'inferno')
+            
+#%% On lance le programme
+
+#On réinitialise toutes les valeurs avant de lancer le programme
+M = np.zeros((N, N, 2), dtype=np.int32)
+M = initial_state_rond(M, n1, 1)
+M = initial_state_rond(M, n2, 2) 
+
+
+V_cible_1 = np.zeros(n1) + 150
+V_cible_2 = np.zeros(n2) + 100
+V_cible = np.concatenate((V_cible_1, V_cible_2)) #L'ensemble des volumes cibles
+
+V_c = np.zeros(n1+n2, dtype=np.int32)
+
+for i in range(N):
+    for j in range(N):
+        num = M[i,j,1]
+        if num > 0:
+            idx = num-1 if M[i,j,0] == 1 else n1+num-1
+            V_c[idx] += 1
+
+        
+def_temp(M, 5001)
+
+
+
